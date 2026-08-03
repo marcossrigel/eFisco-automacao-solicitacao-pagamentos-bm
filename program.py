@@ -105,6 +105,8 @@ class RoboEFisco:
 
         historico = []
         anteriores = []
+        registro = dados[linha - 1]
+        data_atual = registro[0].split(" ")[0]
 
         for indice, linha_atual in enumerate(dados, start=1):
 
@@ -118,7 +120,8 @@ class RoboEFisco:
                 registro = {
                     "linha": indice,
                     "resolucao": linha_atual[31],
-                    "valor": linha_atual[14]
+                    "valor": linha_atual[14],
+                    "data": linha_atual[0].split(" ")[0]
                 }
 
                 historico.append(registro)
@@ -143,6 +146,15 @@ class RoboEFisco:
 
             for item in anteriores:
 
+                print(
+                    item["linha"],
+                    item["data"],
+                    item["valor"]
+                )
+                # Ignora registros com a mesma data e hora
+                if item["data"] == data_atual:
+                    continue
+
                 resultado_item = re.search(
                     r"NE(\d+)",
                     item["resolucao"],
@@ -163,6 +175,7 @@ class RoboEFisco:
                         valor_ne += float(
                             valor.replace(".", "").replace(",", ".")
                         )
+
 
         else:
 
