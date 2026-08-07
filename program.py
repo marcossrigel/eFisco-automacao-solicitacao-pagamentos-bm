@@ -7,7 +7,10 @@ from selenium.webdriver.common.by import By
 from google.oauth2.service_account import Credentials
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    StaleElementReferenceException
+)
 from selenium.webdriver.support import expected_conditions as EC
 
 class RoboEFisco:
@@ -83,30 +86,42 @@ class RoboEFisco:
 
         cliente = gspread.authorize(credenciais)
 
-        self.planilha = cliente.open_by_key("1lkM9yOjhu_D2nQjRFl-Wt6lNgWPvzl2wbQiaO633-KM")
+        self.planilha = cliente.open_by_key(
+            "1lkM9yOjhu_D2nQjRFl-Wt6lNgWPvzl2wbQiaO633-KM"
+        )
 
         self.aba = self.planilha.worksheet("BMs 2026")
 
         dados = self.aba.get_all_values()
 
-        linha = 1052
-        registro = dados[linha - 1]
+        # ============================================================
+        # REGISTRO QUE SERÁ PROCESSADO
+        # ============================================================
 
-        numero_sei = registro[11] 
-        numero_contrato = registro[4]   
-        descricao = registro[7]          
-        fonte = registro[15]
-        local_obra = registro[8]
+        linha = 708
+        registro_atual = dados[linha - 1]
+
+        numero_sei = registro_atual[11]
+        numero_contrato = registro_atual[4]
+        descricao = registro_atual[7]
+        fonte = registro_atual[15]
+        local_obra = registro_atual[8]
 
         cidade = ""
 
         contrato = numero_contrato
         fonte_recurso = fonte
 
+        data_atual = registro_atual[0].split(" ")[0]
+
+
+        # ============================================================
+        # MONTA O HISTÓRICO
+        # Contrato + Fonte + Local da obra
+        # ============================================================
+
         historico = []
         anteriores = []
-        registro = dados[linha - 1]
-        data_atual = registro[0].split(" ")[0]
 
         for indice, linha_atual in enumerate(dados, start=1):
 
@@ -117,46 +132,99 @@ class RoboEFisco:
                 and linha_atual[8] == local_obra
             ):
 
-                registro = {
+                item_historico = {
                     "linha": indice,
-                    "resolucao": linha_atual[31],
+                    "resolucao": linha_atual[31].strip(),
                     "valor": linha_atual[14],
                     "data": linha_atual[0].split(" ")[0]
                 }
 
-                historico.append(registro)
+                historico.append(item_historico)
 
-                # Guarda somente as linhas anteriores à atual
+                # Somente registros anteriores ao registro atual
                 if indice < linha:
-                    anteriores.append(registro)
+                    anteriores.append(item_historico)
 
-        if anteriores:
 
-            resolucao = dados[linha - 1][31]
+        # ============================================================
+        # RESOLUÇÃO DA LINHA ATUAL
+        # ============================================================
 
-            # Extrai a NE da resolução
-            resultado = re.search(r"NE(\d+)", resolucao, re.IGNORECASE)
+        resolucao_atual = registro_atual[31].strip()
 
-            if resultado:
-                ne_atual = resultado.group(1)
-            else:
-                ne_atual = ""
+        resolucao = resolucao_atual
+        numero_empenho = ""
+        linha_empenho = None
 
-            valor_ne = 0.0
+        resultado_atual = re.search(
+            r"NE\s*0*(\d+)",
+            resolucao_atual,
+            re.IGNORECASE
+        )
+
+
+        # ============================================================
+        # 1º - VERIFICA SE A PRÓPRIA LINHA POSSUI NE
+        # ============================================================
+
+        if resultado_atual:
+
+            numero_empenho = resultado_atual.group(1)
+            linha_empenho = linha
+
+
+        # ============================================================
+        # 2º - SE NÃO POSSUI NE, PROCURA NOS REGISTROS ANTERIORES
+        # ============================================================
+
+        else:
+
+            for item in reversed(anteriores):
+
+                resolucao_anterior = item["resolucao"]
+
+                resultado_anterior = re.search(
+                    r"NE\s*0*(\d+)",
+                    resolucao_anterior,
+                    re.IGNORECASE
+                )
+
+                # Não possui NE?
+                # Ignora e continua para o próximo registro anterior.
+                if not resultado_anterior:
+                    continue
+
+                # Encontrou uma resolução com NE
+                numero_empenho = resultado_anterior.group(1)
+                resolucao = resolucao_anterior
+                linha_empenho = item["linha"]
+
+                print(
+                    f"Empenho encontrado no registro anterior "
+                    f"{item['linha']}: {resolucao_anterior}"
+                )
+
+                # Encontrou o registro anterior que precisamos.
+                # Para imediatamente a pesquisa.
+                break
+
+
+        # ============================================================
+        # SOMA O HISTÓRICO DA NE ENCONTRADA
+        # ============================================================
+
+        valor_ne = 0.0
+
+        if numero_empenho:
 
             for item in anteriores:
 
-                print(
-                    item["linha"],
-                    item["data"],
-                    item["valor"]
-                )
-                # Ignora registros com a mesma data e hora
+                # Ignora registros da mesma data
                 if item["data"] == data_atual:
                     continue
 
                 resultado_item = re.search(
-                    r"NE(\d+)",
+                    r"NE\s*0*(\d+)",
                     item["resolucao"],
                     re.IGNORECASE
                 )
@@ -166,28 +234,21 @@ class RoboEFisco:
 
                 ne_item = resultado_item.group(1)
 
-                # Soma apenas quem possui a mesma NE
-                if ne_item == ne_atual:
+                # Só soma valores pertencentes à mesma NE
+                if ne_item == numero_empenho:
 
                     valor = item["valor"]
 
                     if valor:
+
                         valor_ne += float(
                             valor.replace(".", "").replace(",", ".")
                         )
 
 
-        else:
-
-            resolucao = ""
-            valor_ne = 0.0
-
-        resultado = re.search(r"NE(\d+)", resolucao)
-
-        if resultado:
-            numero_empenho = resultado.group(1)
-        else:
-            numero_empenho = ""
+        # ============================================================
+        # IDENTIFICA CIDADE NA DESCRIÇÃO
+        # ============================================================
 
         resultado = re.search(
             r"NO MUNIC[IÍ]PIO DE\s+(.+?),\s+NO ESTADO",
@@ -197,6 +258,11 @@ class RoboEFisco:
 
         if resultado:
             cidade = resultado.group(1).title()
+
+
+        # ============================================================
+        # RETORNO
+        # ============================================================
 
         return {
             "linha": linha,
@@ -268,17 +334,11 @@ class RoboEFisco:
 
         time.sleep(3)
 
-        checkbox = wait.until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    f"//tr[td[contains(., 'NE{numero_empenho}')]]//input[@type='checkbox']"
-                )
+        wait.until(
+        EC.element_to_be_clickable(
+                (By.ID, "rdb_consulta")
             )
-        )
-
-        checkbox.click()
-        time.sleep(3)
+        ).click()
 
         wait.until(
             EC.element_to_be_clickable(
@@ -298,45 +358,86 @@ class RoboEFisco:
 
         wait = WebDriverWait(self.driver, 20)
 
-        celula = wait.until(
+        # ============================================================
+        # FUNÇÃO PARA LER CAMPOS EVITANDO STALE ELEMENT
+        # ============================================================
+
+        def pegar_valor(by, localizador):
+
+            for tentativa in range(5):
+
+                try:
+                    elemento = wait.until(
+                        EC.presence_of_element_located(
+                            (by, localizador)
+                        )
+                    )
+
+                    valor = elemento.get_attribute("value")
+
+                    return valor
+
+                except StaleElementReferenceException:
+
+                    time.sleep(1)
+
+            raise Exception(
+                f"Não foi possível ler o campo: {localizador}"
+            )
+
+
+        # ============================================================
+        # AGUARDA A TELA DO EXTRATO
+        # ============================================================
+
+        wait.until(
             EC.presence_of_element_located(
                 (By.ID, "cdCelulaOrcamentaria")
             )
-        ).get_attribute("value")
+        )
 
-        ficha_financeira = wait.until(
-            EC.presence_of_element_located(
-                (By.ID, "cdFichaFinanceiraFormatado")
-            )
-        ).get_attribute("value")
+        time.sleep(2)
 
-        # Remove o código da ficha, mantendo apenas a descrição
+
+        # ============================================================
+        # LÊ OS DADOS
+        # ============================================================
+
+        celula = pegar_valor(
+            By.ID,
+            "cdCelulaOrcamentaria"
+        )
+
+        ficha_financeira = pegar_valor(
+            By.ID,
+            "cdFichaFinanceiraFormatado"
+        )
+
         if " - " in ficha_financeira:
             ficha_financeira = ficha_financeira.split(" - ", 1)[1]
 
-        valor_liquidar = wait.until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    '//*[@id="table_tabeladados"]/tbody/tr[5]/td[2]/input'
-                )
-            )
-        ).get_attribute("value")
 
-        valor_pagar_liquidado = wait.until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    '//*[@id="table_tabeladados"]/tbody/tr[4]/td[2]/input'
-                )
-            )
-        ).get_attribute("value")
+        valor_liquidar = pegar_valor(
+            By.XPATH,
+            '//*[@id="table_tabeladados"]/tbody/tr[5]/td[2]/input'
+        )
+
+        valor_pagar_liquidado = pegar_valor(
+            By.XPATH,
+            '//*[@id="table_tabeladados"]/tbody/tr[4]/td[2]/input'
+        )
+
+
+        # ============================================================
+        # SEPARA CÉLULA ORÇAMENTÁRIA
+        # ============================================================
 
         partes = celula.split(".")
 
         acao = partes[5]
         subacao = partes[6]
         fonte = partes[7]
+
 
         return {
             "celula": celula,
@@ -355,14 +456,24 @@ def main():
     robo.aguardar_login_efisco()
     dados = robo.lendo_planilha()
 
+    print("\n" + "=" * 60)
+    print(f"REGISTRO {dados['linha']}")
     print("=" * 60)
-    print(f"Nº do SEI: {dados['sei']}")
-    print(f"Contrato : {dados['contrato']}")
-    print(f"Local da obra : {dados['local_obra']}")
-    print(f"Fonte : {dados['fonte']}")
-    print(f"Resolução : {dados['resolucao']}")
-    print(f"Empenho : {dados['empenho']}")
+
+    print(f"SEI ..............: {dados['sei']}")
+    print(f"Contrato .........: {dados['contrato']}")
+    print(f"Local da obra ....: {dados['local_obra']}")
+    print(f"Fonte ............: {dados['fonte']}")
+    print(f"Resolução ........: {dados['resolucao']}")
+    print(f"Empenho ..........: {dados['empenho']}")
     print()
+
+    # Verifica se possui empenho
+    if not dados["empenho"] or not str(dados["empenho"]).strip():
+        print("⚠️ Registro sem empenho!")
+        print("=" * 60)
+        input("\nPressione ENTER para encerrar...")
+        return
 
     extrato = robo.consultar_empenho(dados["empenho"])
 
@@ -380,67 +491,43 @@ def main():
 
     valor_ne = dados["valor_ne"]
 
-    print("\n" + "=" * 60)
+
+    # ============================================================
+    # CONFERÊNCIA
+    # ============================================================
+
     print("CONFERÊNCIA DA NE")
-    print("=" * 60)
-    print(f"Soma das resoluções.....: {valor_ne:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    print(f"Valor a Pagar Liquidado.: {valor_pagar_liquidado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    print(
+        f"Soma resoluções ..: R$ "
+        f"{valor_ne:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    )
+
+    print(
+        f"Pago/Liquidado ...: R$ "
+        f"{valor_pagar_liquidado:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    )
 
     if abs(valor_ne - valor_pagar_liquidado) < 0.01:
-        print("Resultado...............: OK")
+        print("Resultado ........: ✅ OK")
         valor_disponivel = valor_liquidar
     else:
-        print("Resultado...............: DIVERGENTE")
+        print("Resultado ........: ❌ DIVERGENTE")
         valor_disponivel = valor_liquidar - valor_ne
 
-    print("=" * 60)
 
-    print(f"Célula Orçamentária: {extrato['celula']}")
-    print(f"Ficha Financeira: {extrato['ficha_financeira']}")
-    print(f"Ação: {extrato['acao']}")
-    print(f"Subação: {extrato['subacao']}")
-    print(f"Fonte: {extrato['fonte']}")
-    print(f"Valor a Liquidar: {extrato['valor_liquidar']}")
-    valor_disponivel_formatado = (
-        f"{valor_disponivel:,.2f}"
-        .replace(",", "X")
-        .replace(".", ",")
-        .replace("X", ".")
-    )
-    print(f"Valor Disponível de NE: {valor_disponivel_formatado}")
-    print("=" * 60)
+    # ============================================================
+    # DADOS ORÇAMENTÁRIOS
+    # ============================================================
 
     print()
+    print("DADOS ORÇAMENTÁRIOS")
 
-    print("\n" + "=" * 60)
-    print("SIMULAÇÃO DA ESCRITA NA PLANILHA")
-    print("=" * 60)
-
-    # AC - Ação (coluna 29)
-    print(
-        f"Linha {dados['linha']} | Ação -> {extrato['acao']}"
-    )
-
-    # AD - Subação (coluna 30)
-    print(
-        f"Linha {dados['linha']} | Subação -> {extrato['subacao']}"
-    )
-
-    # AE - Fonte (coluna 31)
-    print(
-        f"Linha {dados['linha']} | Fonte -> {extrato['fonte']}"
-    )
-
-    # AG - Ficha Financeira (coluna 33)
-    print(
-        f"Linha {dados['linha']} | Ficha Financeira -> {extrato['ficha_financeira']}"
-    )
-
-    # AK - Valor Disponível de NE (coluna 37)
-    print(
-        f"Linha {dados['linha']} | Valor Disponível de NE -> "
-        f"{valor_disponivel:.2f}".replace(".", ",")
-    )
+    print(f"Ficha Financeira .: {extrato['ficha_financeira']}")
+    print(f"Ação .............: {extrato['acao']}")
+    print(f"Subação ..........: {extrato['subacao']}")
+    print(f"Fonte ............: {extrato['fonte']}")
+    print(f"Valor a Liquidar .: R$ {extrato['valor_liquidar']}")
 
     print("=" * 60)
 
