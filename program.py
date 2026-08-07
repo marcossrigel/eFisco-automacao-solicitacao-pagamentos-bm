@@ -98,7 +98,7 @@ class RoboEFisco:
         # REGISTRO QUE SERÁ PROCESSADO
         # ============================================================
 
-        linha = 708
+        linha = 723
         registro_atual = dados[linha - 1]
 
         numero_sei = registro_atual[11]
