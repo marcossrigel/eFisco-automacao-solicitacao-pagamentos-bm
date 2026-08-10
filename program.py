@@ -1,6 +1,7 @@
 import re
 import time
 import gspread
+from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -72,6 +73,7 @@ class RoboEFisco:
         self.driver.switch_to.new_window("tab")
         self.driver.get("https://efisco.sefaz.pe.gov.br/")
 
+
     def lendo_planilha(self):
 
         scopes = [
@@ -94,11 +96,87 @@ class RoboEFisco:
 
         dados = self.aba.get_all_values()
 
+        def pegar_celula(registro, coluna):
+            if len(registro) > coluna:
+                return registro[coluna].strip()
+            return ""
+
         # ============================================================
-        # REGISTRO QUE SERÁ PROCESSADO
+        # PROCURA O PRÓXIMO REGISTRO PENDENTE DE HOJE
+        # Carimbo preenchido + data de hoje + AK vazia
+        # Processa apenas UM por execução
         # ============================================================
 
-        linha = 723
+        linha = None
+
+        COLUNA_CARIMBO = 0
+
+        COLUNA_ACAO = 28               # AC
+        COLUNA_SUBACAO = 29            # AD
+        COLUNA_FONTE = 30              # AE
+        COLUNA_FICHA_FINANCEIRA = 32   # AG
+        COLUNA_VALOR_DISPONIVEL = 36   # AK
+
+        hoje = datetime.now().date()
+
+        for indice in range(1, len(dados)):
+
+            registro = dados[indice]
+
+            carimbo = (
+                registro[COLUNA_CARIMBO].strip()
+                if len(registro) > COLUNA_CARIMBO
+                else ""
+            )
+
+            acao_preenchida = pegar_celula(registro, COLUNA_ACAO)
+            subacao_preenchida = pegar_celula(registro, COLUNA_SUBACAO)
+            fonte_preenchida = pegar_celula(registro, COLUNA_FONTE)
+            ficha_preenchida = pegar_celula(registro, COLUNA_FICHA_FINANCEIRA)
+            valor_preenchido = pegar_celula(registro, COLUNA_VALOR_DISPONIVEL)
+
+            # Sem carimbo?
+            if not carimbo:
+                continue
+
+            # Se QUALQUER campo já estiver preenchido,
+            # ignora o registro
+            if (
+                acao_preenchida
+                or subacao_preenchida
+                or fonte_preenchida
+                or ficha_preenchida
+                or valor_preenchido
+            ):
+                continue
+
+            # Converte o carimbo da planilha
+            try:
+                data_registro = datetime.strptime(
+                    carimbo,
+                    "%d/%m/%Y %H:%M:%S"
+                )
+            except ValueError:
+                continue
+
+            # Só aceita registros de HOJE
+            if data_registro.date() != hoje:
+                continue
+
+            linha = indice + 1
+            carimbo_registro = carimbo
+            # Apenas UM por execução
+            break
+
+
+        if linha is None:
+            print(
+                f"⏳ Nenhum registro pendente encontrado para "
+                f"{hoje.strftime('%d/%m/%Y')}."
+            )
+            return None
+
+
         registro_atual = dados[linha - 1]
 
         numero_sei = registro_atual[11]
@@ -149,65 +227,36 @@ class RoboEFisco:
         # ============================================================
         # RESOLUÇÃO DA LINHA ATUAL
         # ============================================================
+        
+        # ============================================================
+        # PROCURA A NE SEMPRE NOS REGISTROS ANTERIORES
+        # ============================================================
 
-        resolucao_atual = registro_atual[31].strip()
-
-        resolucao = resolucao_atual
+        resolucao = ""
         numero_empenho = ""
         linha_empenho = None
 
-        resultado_atual = re.search(
-            r"NE\s*0*(\d+)",
-            resolucao_atual,
-            re.IGNORECASE
-        )
+        for item in reversed(anteriores):
 
+            resolucao_anterior = item["resolucao"]
 
-        # ============================================================
-        # 1º - VERIFICA SE A PRÓPRIA LINHA POSSUI NE
-        # ============================================================
+            if not resolucao_anterior:
+                continue
 
-        if resultado_atual:
+            resultado_anterior = re.search(
+                r"NE\s*0*(\d+)",
+                resolucao_anterior,
+                re.IGNORECASE
+            )
 
-            numero_empenho = resultado_atual.group(1)
-            linha_empenho = linha
+            if not resultado_anterior:
+                continue
 
+            numero_empenho = resultado_anterior.group(1)
+            resolucao = resolucao_anterior
+            linha_empenho = item["linha"]
 
-        # ============================================================
-        # 2º - SE NÃO POSSUI NE, PROCURA NOS REGISTROS ANTERIORES
-        # ============================================================
-
-        else:
-
-            for item in reversed(anteriores):
-
-                resolucao_anterior = item["resolucao"]
-
-                resultado_anterior = re.search(
-                    r"NE\s*0*(\d+)",
-                    resolucao_anterior,
-                    re.IGNORECASE
-                )
-
-                # Não possui NE?
-                # Ignora e continua para o próximo registro anterior.
-                if not resultado_anterior:
-                    continue
-
-                # Encontrou uma resolução com NE
-                numero_empenho = resultado_anterior.group(1)
-                resolucao = resolucao_anterior
-                linha_empenho = item["linha"]
-
-                print(
-                    f"Empenho encontrado no registro anterior "
-                    f"{item['linha']}: {resolucao_anterior}"
-                )
-
-                # Encontrou o registro anterior que precisamos.
-                # Para imediatamente a pesquisa.
-                break
-
+            break
 
         # ============================================================
         # SOMA O HISTÓRICO DA NE ENCONTRADA
@@ -218,10 +267,6 @@ class RoboEFisco:
         if numero_empenho:
 
             for item in anteriores:
-
-                # Ignora registros da mesma data
-                if item["data"] == data_atual:
-                    continue
 
                 resultado_item = re.search(
                     r"NE\s*0*(\d+)",
@@ -266,12 +311,14 @@ class RoboEFisco:
 
         return {
             "linha": linha,
+            "carimbo": carimbo_registro,
             "contrato": numero_contrato,
             "local_obra": local_obra,
             "fonte": fonte,
             "sei": numero_sei,
             "resolucao": resolucao,
             "empenho": numero_empenho,
+            "linha_empenho": linha_empenho,
             "valor_ne": valor_ne
         }
 
@@ -456,9 +503,19 @@ def main():
     robo.aguardar_login_efisco()
     dados = robo.lendo_planilha()
 
-    print("\n" + "=" * 60)
-    print(f"REGISTRO {dados['linha']}")
+    if dados is None:
+        print("Nenhum registro para processar.")
+        return
+
+    print("\n")
     print("=" * 60)
+    print(f"🆕 Carimbo: {dados['carimbo']}")
+    print(f"REGISTRO {dados['linha']}")
+    print(
+        f"Empenho encontrado no registro anterior "
+        f"{dados['linha_empenho']}: {dados['resolucao']}"
+    )
+    print()
 
     print(f"SEI ..............: {dados['sei']}")
     print(f"Contrato .........: {dados['contrato']}")
@@ -496,31 +553,31 @@ def main():
     # CONFERÊNCIA
     # ============================================================
 
-    print("CONFERÊNCIA DA NE")
+    #print("CONFERÊNCIA DA NE")
 
-    print(
-        f"Soma resoluções ..: R$ "
-        f"{valor_ne:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    )
+    #print(
+    #    f"Soma resoluções ..: R$ "
+    #    f"{valor_ne:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    #)
 
-    print(
-        f"Pago/Liquidado ...: R$ "
-        f"{valor_pagar_liquidado:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    )
+    #print(
+    #    f"Pago/Liquidado ...: R$ "
+    #    f"{valor_pagar_liquidado:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    #)
 
-    if abs(valor_ne - valor_pagar_liquidado) < 0.01:
-        print("Resultado ........: ✅ OK")
-        valor_disponivel = valor_liquidar
-    else:
-        print("Resultado ........: ❌ DIVERGENTE")
-        valor_disponivel = valor_liquidar - valor_ne
+    #if abs(valor_ne - valor_pagar_liquidado) < 0.01:
+    #    print("Resultado ........: ✅ OK")
+    #    valor_disponivel = valor_liquidar
+    #else:
+    #    print("Resultado ........: ❌ DIVERGENTE")
+    #    valor_disponivel = valor_liquidar - valor_ne
 
 
     # ============================================================
     # DADOS ORÇAMENTÁRIOS
     # ============================================================
 
-    print()
+    #print()
     print("DADOS ORÇAMENTÁRIOS")
 
     print(f"Ficha Financeira .: {extrato['ficha_financeira']}")
