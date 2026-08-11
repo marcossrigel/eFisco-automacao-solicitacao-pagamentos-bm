@@ -1,617 +1,1324 @@
+import os
+import gspread
 import re
 import time
-import gspread
+
+from urllib.parse import urlparse, parse_qs
+from num2words import num2words
+from dotenv import load_dotenv
+from selenium.common.exceptions import UnexpectedAlertPresentException
+from selenium.webdriver.common.alert import Alert
+from selenium.webdriver.common.keys import Keys
+from seleniumbase import Driver
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from oauth2client.service_account import ServiceAccountCredentials
+from selenium.webdriver.common.by import By
 from datetime import datetime
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from google.oauth2.service_account import Credentials
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    StaleElementReferenceException
+PLANILHA_ID = "1lkM9yOjhu_D2nQjRFl-Wt6lNgWPvzl2wbQiaO633-KM"
+ABA = "BMs 2026"
+
+ARQUIVO_CREDENCIAIS = (
+"arquivos_json/"
+"formulariosolicitacaopagamento-f683a63c3e41.json"
 )
-from selenium.webdriver.support import expected_conditions as EC
 
-class RoboEFisco:
+def conectar_planilha():
 
-    def __init__(self):
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = (
+        ServiceAccountCredentials
+        .from_json_keyfile_name(
+            ARQUIVO_CREDENCIAIS,
+            scope
+        )
+    )
+    client = gspread.authorize(creds)
+    planilha = client.open_by_key(
+        PLANILHA_ID
+    )
+    worksheet = planilha.worksheet(
+        ABA
+    )
+    return worksheet
 
-        options = Options()
-        options.add_experimental_option(
-            "debuggerAddress",
-            "127.0.0.1:9222"
+def atualizar_planilha_enviado(linha_planilha):
+
+    worksheet = conectar_planilha()
+
+    data_hoje = datetime.now().strftime(
+        "%d/%m/%Y"
+    )
+
+    #
+    # STATUS
+    #
+
+    worksheet.update_cell(
+        linha_planilha,
+        26,  # Z
+        "AGUARDANDO ASSINATURA"
+    )
+
+    #
+    # SETOR ATUAL
+    #
+
+    worksheet.update_cell(
+        linha_planilha,
+        27,  # AA
+        "GAC"
+    )
+
+    #
+    # DATA DA LIBERAÇÃO
+    #
+
+    worksheet.update_cell(
+        linha_planilha,
+        28,  # AB
+        data_hoje
+    )
+
+    #
+    # JÁ FOI CRIADO O DOCUMENTO?
+    #
+
+    worksheet.update_cell(
+        linha_planilha,
+        39,  # AM
+        "SIM"
+    )
+
+    print(
+        f"PLANILHA ATUALIZADA "
+        f"(linha {linha_planilha})"
+    )
+
+def obter_aguardando_sei():
+
+    worksheet = conectar_planilha()
+
+    registros = worksheet.get_all_records()
+
+    lista = []
+
+    for idx, linha in enumerate(
+        registros,
+        start=2
+    ):
+
+        status = str(
+            linha.get(
+                "STATUS",
+                ""
+            )
+        ).strip().upper()
+
+        if status == "AGUARDANDO SEI":
+
+            lista.append({
+
+                "linha_planilha": idx,
+
+                "numero_sei":
+                linha.get(
+                    "N° do SEI",
+                    ""
+                ),
+
+                "fonte":
+                linha.get(
+                    "FONTE",
+                    ""
+                ),
+
+                "fonte_recurso":
+                linha.get(
+                    "Fonte de Recursos",
+                    ""
+                ),
+
+                "ficha_financeira":
+                linha.get(
+                    "Ficha Financeira",
+                    ""
+                ),
+
+                "resolucao":
+                linha.get(
+                    "RESOLUÇÃO",
+                    ""
+                ),
+
+                "responsavel":
+                linha.get(
+                    "RESPONSÁVEL",
+                    ""
+                ),
+
+                "linha_completa":
+                worksheet.row_values(idx)
+            })
+
+    return lista
+
+def iniciar_robo():
+
+    load_dotenv(
+        "arquivos_json/arquivo.env"
+    )
+
+    usuario = os.getenv(
+        "SEI_USER"
+    )
+
+    senha = os.getenv(
+        "SEI_PASS"
+    )
+
+    browser = Driver(
+        uc=False,
+        headless=True,
+        log_cdp=False
+    )
+
+    browser.get(
+        "https://sei.pe.gov.br/sip/login.php?sigla_orgao_sistema=GOVPE&sigla_sistema=SEI"
+    )
+
+    browser.sleep(3)
+
+    browser.find_element(
+        "css selector",
+        "#selOrgao"
+    ).send_keys(
+        "CEHAB"
+    )
+
+    browser.find_element(
+        "xpath",
+        '//*[@id="txtUsuario"]'
+    ).send_keys(
+        usuario
+    )
+
+    browser.find_element(
+        "xpath",
+        '//*[@id="pwdSenha"]'
+    ).send_keys(
+        senha
+    )
+
+    browser.find_element(
+        "xpath",
+        '//*[@id="sbmAcessar"]'
+    ).click()
+
+    browser.sleep(5)
+
+    return browser
+
+def verificar_recebidos(browser, numero_sei):
+
+    try:
+        tabela = browser.find_element(
+            "xpath",
+            '//*[@id="tblProcessosRecebidos"]'
         )
 
-        self.driver = webdriver.Chrome(options=options)
-
-        self.planilha = None
-        self.aba = None
-
-    def aguardar_login_efisco(self):
-
-        while True:
-
-            try:
-                self.driver.find_element(
-                    By.XPATH,
-                    '//*[@id="a_usuario"]'
-                )
-                return "✅ Usuario Logado no eFisco"
-
-            except NoSuchElementException:
-                pass
-
-            try:
-                botao = self.driver.find_element(
-                    By.XPATH,
-                    '//*[@id="btt_gov"]'
-                )
-                botao.click()
-                time.sleep(2)
-                continue
-
-            except NoSuchElementException:
-                pass
-
-            try:
-                WebDriverWait(self.driver, 300).until(
-                    EC.presence_of_element_located(
-                        (By.ID, "a_usuario")
-                    )
-                )
-
-                print("✅ Usuário Logado no eFisco")
-                return "Usuario Logado no eFisco"
-
-            except:
-                return None
-
-    def abrir_efisco(self):
-
-        self.driver.switch_to.new_window("tab")
-        self.driver.get("https://efisco.sefaz.pe.gov.br/")
-
-
-    def lendo_planilha(self):
-
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-
-        credenciais = Credentials.from_service_account_file(
-            "credenciais.json",
-            scopes=scopes
+        html = tabela.get_attribute(
+            "outerHTML"
         )
 
-        cliente = gspread.authorize(credenciais)
+        from bs4 import BeautifulSoup
 
-        self.planilha = cliente.open_by_key(
-            "1lkM9yOjhu_D2nQjRFl-Wt6lNgWPvzl2wbQiaO633-KM"
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
         )
 
-        self.aba = self.planilha.worksheet("BMs 2026")
+        links = soup.find_all("a")
 
-        dados = self.aba.get_all_values()
+        for link in links:
 
-        def pegar_celula(registro, coluna):
-            if len(registro) > coluna:
-                return registro[coluna].strip()
-            return ""
-
-        # ============================================================
-        # PROCURA O PRÓXIMO REGISTRO PENDENTE DE HOJE
-        # Carimbo preenchido + data de hoje + AK vazia
-        # Processa apenas UM por execução
-        # ============================================================
-
-        linha = None
-
-        COLUNA_CARIMBO = 0
-
-        COLUNA_ACAO = 28               # AC
-        COLUNA_SUBACAO = 29            # AD
-        COLUNA_FONTE = 30              # AE
-        COLUNA_FICHA_FINANCEIRA = 32   # AG
-        COLUNA_VALOR_DISPONIVEL = 36   # AK
-
-        hoje = datetime.now().date()
-
-        for indice in range(1, len(dados)):
-
-            registro = dados[indice]
-
-            carimbo = (
-                registro[COLUNA_CARIMBO].strip()
-                if len(registro) > COLUNA_CARIMBO
-                else ""
+            processo = link.get_text(
+                strip=True
             )
 
-            acao_preenchida = pegar_celula(registro, COLUNA_ACAO)
-            subacao_preenchida = pegar_celula(registro, COLUNA_SUBACAO)
-            fonte_preenchida = pegar_celula(registro, COLUNA_FONTE)
-            ficha_preenchida = pegar_celula(registro, COLUNA_FICHA_FINANCEIRA)
-            valor_preenchido = pegar_celula(registro, COLUNA_VALOR_DISPONIVEL)
+            if processo == numero_sei:
 
-            # Sem carimbo?
-            if not carimbo:
-                continue
-
-            # Se QUALQUER campo já estiver preenchido,
-            # ignora o registro
-            if (
-                acao_preenchida
-                or subacao_preenchida
-                or fonte_preenchida
-                or ficha_preenchida
-                or valor_preenchido
-            ):
-                continue
-
-            # Converte o carimbo da planilha
-            try:
-                data_registro = datetime.strptime(
-                    carimbo,
-                    "%d/%m/%Y %H:%M:%S"
+                print(
+                    f"{numero_sei} ENCONTRADO"
                 )
-            except ValueError:
-                continue
 
-            # Só aceita registros de HOJE
-            if data_registro.date() != hoje:
-                continue
+                campo_pesquisa = browser.find_element(
+                    "xpath",
+                    '//*[@id="txtPesquisaRapida"]'
+                )
 
-            linha = indice + 1
-            carimbo_registro = carimbo
-            # Apenas UM por execução
-            break
+                campo_pesquisa.clear()
+
+                campo_pesquisa.send_keys(
+                    numero_sei
+                )
+
+                print(
+                    f"{numero_sei} DIGITADO "
+                    f"NA PESQUISA"
+                )
+
+                lupa = browser.find_element(
+                    "xpath",
+                    '//*[@id="spnInfraUnidade"]/img'
+                )
+
+                lupa.click()
+                browser.sleep(5)
+
+                return True
+
+        print(f"{numero_sei} NÃO ENCONTRADO")
+        print("========================================================================================")
+
+        return False
+
+    except Exception as erro:
+
+        print(
+            f"ERRO VERIFICAR RECEBIDOS: "
+            f"{erro}"
+        )
+
+        return False
+
+def criar_documento(browser, dados):
+
+    try:
+
+        browser.switch_to.default_content()
+
+        iframes = browser.find_elements(
+            "tag name",
+            "iframe"
+        )
+
+        browser.switch_to.frame(
+            iframes[0]
+        )
+
+        links = browser.find_elements(
+            By.TAG_NAME,
+            "a"
+        )
+
+        ultima_solicitacao = None
+
+        for link in links:
+
+            texto = link.text.strip()
+
+            if "CEHAB - SOLICITAÇÃO DE DISPONIBILIDADE FINANCEIRA" in texto.upper():
+                ultima_solicitacao = texto
 
 
-        if linha is None:
-            print(
-                f"⏳ Nenhum registro pendente encontrado para "
-                f"{hoje.strftime('%d/%m/%Y')}."
-            )
+        if ultima_solicitacao is None:
+
+            print("NENHUMA SOLICITAÇÃO ENCONTRADA")
+            print("=" * 88)
+
             return None
 
 
-        registro_atual = dados[linha - 1]
+        print(f"ÚLTIMA SOLICITAÇÃO: {ultima_solicitacao}")
 
-        numero_sei = registro_atual[11]
-        numero_contrato = registro_atual[4]
-        descricao = registro_atual[7]
-        fonte = registro_atual[15]
-        local_obra = registro_atual[8]
+        numero = re.search(r"(\d{8})", ultima_solicitacao)
 
-        cidade = ""
+        if numero is None:
 
-        contrato = numero_contrato
-        fonte_recurso = fonte
+            print("NÚMERO DA SOLICITAÇÃO NÃO ENCONTRADO")
+            return None
 
-        data_atual = registro_atual[0].split(" ")[0]
+        numero = numero.group(1)
 
+        browser.switch_to.default_content()
 
-        # ============================================================
-        # MONTA O HISTÓRICO
-        # Contrato + Fonte + Local da obra
-        # ============================================================
+        browser.switch_to.frame(
+            iframes[1]
+        )
 
-        historico = []
-        anteriores = []
+        botao = browser.find_element(
+            "xpath",
+            '//img[@title="Incluir Documento"]'
+        )
 
-        for indice, linha_atual in enumerate(dados, start=1):
+        browser.execute_script(
+            "arguments[0].click();",
+            botao
+        )
 
-            if (
-                len(linha_atual) > 31
-                and linha_atual[4] == contrato
-                and linha_atual[15] == fonte_recurso
-                and linha_atual[8] == local_obra
-            ):
+        browser.sleep(3)
 
-                item_historico = {
-                    "linha": indice,
-                    "resolucao": linha_atual[31].strip(),
-                    "valor": linha_atual[14],
-                    "data": linha_atual[0].split(" ")[0]
-                }
+        iframe_visualizacao = browser.find_element(
+            "id",
+            "ifrVisualizacao"
+        )
 
-                historico.append(item_historico)
+        browser.switch_to.frame(
+            iframe_visualizacao
+        )
 
-                # Somente registros anteriores ao registro atual
-                if indice < linha:
-                    anteriores.append(item_historico)
+        documento_gop = browser.find_element(
+            "xpath",
+            '//*[@id="tblSeries"]/tbody/tr[2]/td/a[2]'
+        )
 
+        browser.execute_script(
+            "arguments[0].click();",
+            documento_gop
+        )
 
-        # ============================================================
-        # RESOLUÇÃO DA LINHA ATUAL
-        # ============================================================
-        
-        # ============================================================
-        # PROCURA A NE SEMPRE NOS REGISTROS ANTERIORES
-        # ============================================================
+        browser.sleep(5)
 
-        resolucao = ""
-        numero_empenho = ""
-        linha_empenho = None
+        # DESTINATÁRIO
 
-        for item in reversed(anteriores):
+        campo_destinatario = browser.find_element(
+            "id",
+            "txtDestinatario"
+        )
 
-            resolucao_anterior = item["resolucao"]
+        campo_destinatario.send_keys(
+            "GAC"
+        )
 
-            if not resolucao_anterior:
-                continue
+        browser.sleep(1)
 
-            resultado_anterior = re.search(
-                r"NE\s*0*(\d+)",
-                resolucao_anterior,
-                re.IGNORECASE
+        campo_destinatario.send_keys(
+            Keys.ESCAPE
+        )
+        # =====================================================
+        # RESPONSÁVEL / INTERESSADO
+        # =====================================================
+
+        responsavel = str(
+            dados.get("responsavel", "")
+        ).strip()
+
+        # -----------------------------------------------------
+        # REMOVE QUALQUER INTERESSADO QUE JÁ VENHA PREENCHIDO
+        # Ex.: GUEST
+        # -----------------------------------------------------
+
+        while True:
+
+            interessados = browser.find_elements(
+                By.XPATH,
+                '//*[@id="selInteressados"]/option'
             )
 
-            if not resultado_anterior:
-                continue
+            if not interessados:
+                break
 
-            numero_empenho = resultado_anterior.group(1)
-            resolucao = resolucao_anterior
-            linha_empenho = item["linha"]
+            interessado_existente = interessados[0]
 
-            break
+            print(
+                f"REMOVENDO INTERESSADO PRÉ-DEFINIDO: "
+                f"{interessado_existente.text}"
+            )
 
-        # ============================================================
-        # SOMA O HISTÓRICO DA NE ENCONTRADA
-        # ============================================================
+            browser.execute_script(
+                "arguments[0].selected = true;",
+                interessado_existente
+            )
 
-        valor_ne = 0.0
+            botao_remover = browser.find_element(
+                By.XPATH,
+                '//*[@id="imgRemoverInteressados"]'
+            )
 
-        if numero_empenho:
+            browser.execute_script(
+                "arguments[0].click();",
+                botao_remover
+            )
 
-            for item in anteriores:
+            browser.sleep(1)
 
-                resultado_item = re.search(
-                    r"NE\s*0*(\d+)",
-                    item["resolucao"],
-                    re.IGNORECASE
+        print(
+            "INTERESSADOS PRÉ-DEFINIDOS REMOVIDOS"
+        )
+
+        # -----------------------------------------------------
+        # SE EXISTIR RESPONSÁVEL NA PLANILHA
+        # -----------------------------------------------------
+
+        if responsavel:
+
+            campo_interessado = browser.find_element(
+                By.XPATH,
+                '//*[@id="txtInteressado"]'
+            )
+
+            campo_interessado.clear()
+
+            # Digita somente o login
+            # Ex.: cesar.cfilho
+            campo_interessado.send_keys(
+                responsavel
+            )
+
+            print(
+                f"BUSCANDO RESPONSÁVEL: {responsavel}"
+            )
+
+            browser.sleep(2)
+
+            # -------------------------------------------------
+            # SELECIONA A SUGESTÃO QUE APARECE
+            # -------------------------------------------------
+
+            campo_interessado.send_keys(
+                Keys.ARROW_DOWN
+            )
+
+            browser.sleep(1)
+
+            campo_interessado.send_keys(
+                Keys.ENTER
+            )
+
+            browser.sleep(2)
+
+            print(
+                f"RESPONSÁVEL SELECIONADO: {responsavel}"
+            )
+
+        else:
+
+            print(
+                "RESPONSÁVEL VAZIO - "
+                "INTERESSADOS PERMANECERÁ VAZIO"
+            )
+
+        # PÚBLICO
+
+        radio_publico = browser.find_element(
+            "id",
+            "optPublico"
+        )
+
+        browser.execute_script(
+            "arguments[0].click();",
+            radio_publico
+        )
+
+        browser.sleep(1)
+
+        # SALVAR
+
+        botao_salvar = browser.find_element(
+            "id",
+            "btnSalvar"
+        )
+
+        browser.execute_script(
+            "arguments[0].click();",
+            botao_salvar
+        )
+
+        browser.sleep(5)
+
+        browser.switch_to.default_content()
+
+        return numero
+
+    except Exception as erro:
+
+        print(
+            f"ERRO: {erro}"
+        )
+
+        return None
+
+def capturar_id_documento(browser):
+
+    try:
+
+        browser.switch_to.default_content()
+
+        #
+        # ÁRVORE DO PROCESSO
+        #
+
+        iframes = browser.find_elements(
+            By.TAG_NAME,
+            "iframe"
+        )
+
+        browser.switch_to.frame(
+            iframes[0]
+        )
+
+        links = browser.find_elements(
+            By.TAG_NAME,
+            "a"
+        )
+
+        for link in links:
+
+            texto = link.text.strip()
+
+            if "CEHAB - DISPONIBILIDADE FINANCEIRA - GOP" in texto:
+
+                print(f"DOCUMENTO: {texto}")
+
+                numero = re.search(
+                    r"(\d{8})$",
+                    texto
                 )
 
-                if not resultado_item:
-                    continue
+                if numero:
 
-                ne_item = resultado_item.group(1)
-
-                # Só soma valores pertencentes à mesma NE
-                if ne_item == numero_empenho:
-
-                    valor = item["valor"]
-
-                    if valor:
-
-                        valor_ne += float(
-                            valor.replace(".", "").replace(",", ".")
-                        )
-
-
-        # ============================================================
-        # IDENTIFICA CIDADE NA DESCRIÇÃO
-        # ============================================================
-
-        resultado = re.search(
-            r"NO MUNIC[IÍ]PIO DE\s+(.+?),\s+NO ESTADO",
-            descricao,
-            re.IGNORECASE
-        )
-
-        if resultado:
-            cidade = resultado.group(1).title()
-
-
-        # ============================================================
-        # RETORNO
-        # ============================================================
-
-        return {
-            "linha": linha,
-            "carimbo": carimbo_registro,
-            "contrato": numero_contrato,
-            "local_obra": local_obra,
-            "fonte": fonte,
-            "sei": numero_sei,
-            "resolucao": resolucao,
-            "empenho": numero_empenho,
-            "linha_empenho": linha_empenho,
-            "valor_ne": valor_ne
-        }
-
-    def consultar_empenho(self, numero_empenho):
-
-        self.driver.get("https://efisco.sefaz.pe.gov.br/sfi_com_sca/PRMontarMenuAcesso")
-        time.sleep(5)
-
-        wait = WebDriverWait(self.driver, 20)
-
-        wait.until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    '//*[@id="favoritos_carrossel_itens"]/div/ul/li[1]/a'
-                )
-            )
-        ).click()
-
-        wait.until(
-            EC.visibility_of_element_located(
-                (By.XPATH, '//*[@id="primeiro_campo"]')
-            )
-        )
-
-        ug = self.driver.find_element(
-            By.XPATH,
-            '//*[@id="primeiro_campo"]'
-        )
-
-        ug.clear()
-        ug.send_keys("651101")
-
-        time.sleep(3)
-
-        campo = self.driver.find_element(
-            By.XPATH,
-            '//*[@id="nuEmpenho"]'
-        )
-
-        campo.clear()
-        campo.send_keys(numero_empenho)
-
-        self.driver.find_element(
-            By.XPATH,
-            '//*[@id="tpOrdenacaoConsultaEmpenho"]'
-        ).click()
-
-        time.sleep(3)
-        self.driver.find_element(
-            By.XPATH,
-            '//*[@id="btt_localizar"]'
-        ).click()
-
-        wait.until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//table//tr[2]")
-            )
-        )
-
-        time.sleep(3)
-
-        wait.until(
-        EC.element_to_be_clickable(
-                (By.ID, "rdb_consulta")
-            )
-        ).click()
-
-        wait.until(
-            EC.element_to_be_clickable(
-                (By.ID, "btt_Extrato")
-            )
-        ).click()
-
-        wait.until(
-            EC.presence_of_element_located(
-                (By.ID, "cdCelulaOrcamentaria")
-            )
-        )
-
-        return self.extrato_empenho()
-
-    def extrato_empenho(self):
-
-        wait = WebDriverWait(self.driver, 20)
-
-        # ============================================================
-        # FUNÇÃO PARA LER CAMPOS EVITANDO STALE ELEMENT
-        # ============================================================
-
-        def pegar_valor(by, localizador):
-
-            for tentativa in range(5):
-
-                try:
-                    elemento = wait.until(
-                        EC.presence_of_element_located(
-                            (by, localizador)
-                        )
+                    print(
+                        f"ID DO DOCUMENTO: {numero.group(1)}"
                     )
 
-                    valor = elemento.get_attribute("value")
+                    browser.switch_to.default_content()
 
-                    return valor
+                    return numero.group(1)
 
-                except StaleElementReferenceException:
+        browser.switch_to.default_content()
 
-                    time.sleep(1)
+        return None
 
-            raise Exception(
-                f"Não foi possível ler o campo: {localizador}"
-            )
+    except Exception as erro:
 
+        browser.switch_to.default_content()
 
-        # ============================================================
-        # AGUARDA A TELA DO EXTRATO
-        # ============================================================
-
-        wait.until(
-            EC.presence_of_element_located(
-                (By.ID, "cdCelulaOrcamentaria")
-            )
+        print(
+            f"ERRO AO CAPTURAR ID: {erro}"
         )
 
-        time.sleep(2)
+        return None
 
+def editar_mensagem(browser,dados,documento,id_documento):
 
-        # ============================================================
-        # LÊ OS DADOS
-        # ============================================================
+    try:
 
-        celula = pegar_valor(
-            By.ID,
-            "cdCelulaOrcamentaria"
+        todas_janelas = browser.window_handles
+
+        browser.switch_to.window(
+            todas_janelas[-1]
         )
 
-        ficha_financeira = pegar_valor(
-            By.ID,
-            "cdFichaFinanceiraFormatado"
+        browser.sleep(3)
+
+        numero_bm = str(
+            dados["linha_completa"][13]
+        ).strip()
+
+        valor = str(
+            dados["linha_completa"][14]
+        ).strip()
+
+        numero_sei = str(
+            dados["numero_sei"]
+        ).strip()
+
+        fonte = str(
+            dados["fonte"]
+        ).strip().zfill(10)
+
+        ficha_financeira = str(
+            dados["ficha_financeira"]
+        ).strip()
+
+        resolucao = str(
+            dados.get("resolucao", "")
+        ).strip()
+
+        numero_solicitacao = str(
+            documento
+        ).strip()
+
+        numero_documento = str(
+            id_documento
+        ).strip()
+
+        iframes = browser.find_elements(
+            By.TAG_NAME,
+            "iframe"
         )
 
-        if " - " in ficha_financeira:
-            ficha_financeira = ficha_financeira.split(" - ", 1)[1]
+        for frame in iframes:
 
+            try:
 
-        valor_liquidar = pegar_valor(
-            By.XPATH,
-            '//*[@id="table_tabeladados"]/tbody/tr[5]/td[2]/input'
+                browser.switch_to.default_content()
+
+                browser.switch_to.window(
+                    todas_janelas[-1]
+                )
+
+                browser.switch_to.frame(
+                    frame
+                )
+
+                html = browser.execute_script(
+                    "return document.body.innerHTML;"
+                )
+
+                if (
+                    "disponibilidade orçamentária"
+                    not in html.lower()
+                ):
+                    continue
+
+                novo_html = html
+                novo_html = novo_html.replace(
+                    "Processo nº",
+                    f"Processo nº: {numero_sei}"
+                )
+
+                novo_html = novo_html.replace(
+                    "Despacho:",
+                    f"Despacho: {numero_documento}"
+                )
+
+                # DESTINATÁRIO
+                novo_html = novo_html.replace(
+                    "@nome_destinatario@",
+                    "GAC"
+                )
+
+                # DESPACHO
+                novo_html = novo_html.replace(
+                    "XX (),",
+                    f"{numero_solicitacao},"
+                )
+
+                # BM
+                novo_html = novo_html.replace(
+                    "BM <b>XX</b>",
+                    f"BM <b>{numero_bm}</b>"
+                )
+
+                valor_float = float(
+                    valor.replace(".", "").replace(",", ".")
+                )
+
+                valor_extenso = num2words(
+                    valor_float,
+                    lang="pt_BR",
+                    to="currency"
+                )
+
+                novo_html = novo_html.replace(
+                    "R$ X.XXX,XX",
+                    f"R$ {valor} ({valor_extenso})"
+                )
+
+                # FONTE
+                texto_fonte = ""
+
+                if fonte:
+                    texto_fonte = fonte
+
+                if ficha_financeira:
+                    if texto_fonte:
+                        texto_fonte += f" ({ficha_financeira})"
+                    else:
+                        texto_fonte = ficha_financeira
+
+                novo_html = novo_html.replace(
+                    "XXXXXXXXXX",
+                    texto_fonte
+                )
+                novo_html = novo_html.replace(
+                    "(Tipo da Fonte Ex.: Tesouro do Estado)",
+                    ""
+                )
+                novo_html = novo_html.replace(
+                    " .",
+                    "."
+                )
+
+                texto_gefin = f"""
+                    <br>
+                    <hr style="border:1px solid #777;">
+                    <br>
+
+                    <p><strong>À GEFIN,</strong></p>
+
+                    <p>{resolucao.replace(chr(10), "<br>")}</p>
+
+                    <br>
+                    """
+
+                novo_html = novo_html.replace(
+                    "Atenciosamente,",
+                    texto_gefin +
+                    '<div style="text-align:center;">Atenciosamente,</div>'
+                )
+                browser.execute_script(
+                    """
+                    document.body.innerHTML = arguments[0];
+                    """,
+                    novo_html
+                )
+
+                novo_html = re.sub(
+                    r'([^<>]+?)\s+registrado\(a\)\s+civilmente\s+como\s+[^<]+',
+                    lambda m: f'<strong>{m.group(1).strip()}</strong>',
+                    novo_html,
+                    flags=re.IGNORECASE
+                )
+
+                # CLICA NO TEXTO
+                # PARA HABILITAR A TOOLBAR
+                browser.find_element(
+                    By.TAG_NAME,
+                    "body"
+                ).click()
+
+                browser.sleep(2)
+
+                browser.switch_to.default_content()
+
+                #
+                # VOLTA PARA O IFRAME
+                #
+
+                browser.switch_to.default_content()
+
+                browser.switch_to.window(
+                    todas_janelas[-1]
+                )
+
+                browser.switch_to.frame(
+                    frame
+                )
+
+                #
+                # DÁ FOCO NO EDITOR
+                #
+
+                body = browser.find_element(
+                    By.TAG_NAME,
+                    "body"
+                )
+
+                body.click()
+
+                browser.sleep(1)
+
+                #
+                # SELECIONA O NÚMERO DO DESPACHO
+                #
+
+                browser.execute_script(f"""
+                var numero = "{numero_solicitacao}";
+                var body = document.body;
+
+                function localizar(node) {{
+
+                    if(node.nodeType === 3) {{
+
+                        var pos = node.textContent.indexOf(numero);
+
+                        if(pos >= 0) {{
+
+                            var range = document.createRange();
+
+                            range.setStart(node, pos);
+                            range.setEnd(node, pos + numero.length);
+
+                            var sel = window.getSelection();
+
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+
+                            return true;
+                        }}
+                    }}
+
+                    for(var i=0;i<node.childNodes.length;i++) {{
+
+                        if(localizar(node.childNodes[i]))
+                            return true;
+                    }}
+
+                    return false;
+                }}
+
+                localizar(body);
+                """)
+
+                browser.sleep(2)
+
+                #
+                # SAI DO IFRAME
+                #
+
+                browser.switch_to.default_content()
+
+                #
+                # BOTÃO LINK
+                #
+
+                botao_link = browser.find_element(
+                    By.XPATH,
+                    '//*[@id="cke_119"]/span[1]'
+                )
+
+                browser.execute_script(
+                    "arguments[0].click();",
+                    botao_link
+                )
+
+                browser.sleep(2)
+
+                #
+                # PROTOCOLO
+                #
+
+                campo_protocolo = WebDriverWait(
+                    browser,
+                    20
+                ).until(
+                    EC.visibility_of_element_located(
+                        (
+                            By.XPATH,
+                            "//*[contains(@id,'textInput')]"
+                        )
+                    )
+                )
+
+                campo_protocolo.clear()
+
+                campo_protocolo.send_keys(
+                    numero_solicitacao
+                )
+
+                browser.sleep(1)
+
+                #
+                # OK
+                #
+
+                ok = WebDriverWait(
+                    browser,
+                    20
+                ).until(
+                    EC.element_to_be_clickable(
+                        (
+                            By.XPATH,
+                            "//*[contains(@id,'label') and normalize-space()='OK']"
+                        )
+                    )
+                )
+
+                browser.execute_script(
+                    "arguments[0].click();",
+                    ok
+                )
+
+                browser.sleep(2)
+
+                browser.sleep(2)
+
+                # SALVAR
+                salvar = browser.find_element(
+                    By.XPATH,
+                    '//*[@id="cke_83_label"]'
+                )
+
+                browser.execute_script(
+                    "arguments[0].click();",
+                    salvar
+                )
+
+                browser.sleep(5)
+
+                # FECHAR JANELA
+                browser.close()
+
+                browser.switch_to.window(
+                    todas_janelas[0]
+                )
+
+                return True
+
+            except UnexpectedAlertPresentException:
+
+                try:
+                    alert = browser.switch_to.alert
+
+                    print(f"ALERTA: {alert.text}")
+
+                    alert.accept()
+
+                except:
+                    pass
+
+                browser.switch_to.default_content()
+
+                return False
+
+        print(
+            "EDITOR NÃO ENCONTRADO"
         )
 
-        valor_pagar_liquidado = pegar_valor(
-            By.XPATH,
-            '//*[@id="table_tabeladados"]/tbody/tr[4]/td[2]/input'
+        return False
+
+    except Exception as erro:
+
+        print(
+            f"ERRO EDITAR MENSAGEM: {erro}"
         )
 
+        return False
 
-        # ============================================================
-        # SEPARA CÉLULA ORÇAMENTÁRIA
-        # ============================================================
+def verificar_gop_existente(browser):
 
-        partes = celula.split(".")
+    try:
 
-        acao = partes[5]
-        subacao = partes[6]
-        fonte = partes[7]
+        browser.switch_to.default_content()
+
+        iframes = browser.find_elements(
+            "tag name",
+            "iframe"
+        )
+
+        browser.switch_to.frame(
+            iframes[0]
+        )
+
+        links = browser.find_elements(
+            By.TAG_NAME,
+            "a"
+        )
+
+        documentos = []
+
+        for link in links:
+
+            texto = link.text.strip()
+
+            if texto:
+                documentos.append(texto)
+
+        # -------------------------------------------------
+        # LOCALIZA A ÚLTIMA SOLICITAÇÃO
+        # -------------------------------------------------
+
+        indice_ultima_solicitacao = None
+        texto_ultima_solicitacao = None
+
+        for indice, texto in enumerate(documentos):
+
+            if (
+                "CEHAB - SOLICITAÇÃO DE DISPONIBILIDADE FINANCEIRA"
+                in texto.upper()
+            ):
+
+                indice_ultima_solicitacao = indice
+                texto_ultima_solicitacao = texto
+
+        # -------------------------------------------------
+        # NÃO ENCONTROU SOLICITAÇÃO
+        # -------------------------------------------------
+
+        if indice_ultima_solicitacao is None:
+
+            print("NENHUMA SOLICITAÇÃO ENCONTRADA")
+
+            browser.switch_to.default_content()
+
+            return False
+
+        print(
+            f"ÚLTIMA SOLICITAÇÃO: "
+            f"{texto_ultima_solicitacao}"
+        )
+
+        # -------------------------------------------------
+        # VERIFICA SOMENTE O QUE VEM DEPOIS
+        # DA ÚLTIMA SOLICITAÇÃO
+        # -------------------------------------------------
+
+        documentos_depois = documentos[
+            indice_ultima_solicitacao + 1:
+        ]
+
+        # -------------------------------------------------
+        # PROCURA UMA GOP DEPOIS DA ÚLTIMA SOLICITAÇÃO
+        # -------------------------------------------------
+
+        for texto in documentos_depois:
+
+            if (
+                "CEHAB - DISPONIBILIDADE FINANCEIRA - GOP"
+                in texto.upper()
+            ):
+
+                print(
+                    f"GOP ENCONTRADA APÓS A ÚLTIMA SOLICITAÇÃO: "
+                    f"{texto}"
+                )
+
+                browser.switch_to.default_content()
+
+                return True
+
+        # -------------------------------------------------
+        # NÃO EXISTE GOP DEPOIS DA ÚLTIMA SOLICITAÇÃO
+        # -------------------------------------------------
+
+        print(
+            "ÚLTIMA SOLICITAÇÃO AINDA NÃO POSSUI "
+            "DOCUMENTO DE DISPONIBILIDADE"
+        )
+
+        browser.switch_to.default_content()
+
+        return False
+
+    except Exception as erro:
+
+        browser.switch_to.default_content()
+
+        print(
+            f"ERRO VERIFICAR GOP: {erro}"
+        )
+
+        return False
+
+def formatar_responsavel(responsavel):
+
+    responsavel = str(responsavel or "").strip()
+
+    if not responsavel:
+        return ""
+
+    if responsavel.lower() == "julio.galvao":
+        cargo = "Gerente de Orçamento"
+    else:
+        cargo = "Assessor Administrativo"
+
+    return f"{responsavel} {cargo}"
 
 
-        return {
-            "celula": celula,
-            "ficha_financeira": ficha_financeira,
-            "acao": acao,
-            "subacao": subacao,
-            "fonte": fonte,
-            "valor_liquidar": valor_liquidar,
-            "valor_pagar_liquidado": valor_pagar_liquidado
-        }
+def voltar_recebidos(browser):
 
-def main():
+    browser.switch_to.default_content()
 
-    robo = RoboEFisco()
-    robo.abrir_efisco()
-    robo.aguardar_login_efisco()
-    dados = robo.lendo_planilha()
-
-    if dados is None:
-        print("Nenhum registro para processar.")
-        return
-
-    print("\n")
-    print("=" * 60)
-    print(f"🆕 Carimbo: {dados['carimbo']}")
-    print(f"REGISTRO {dados['linha']}")
-    print(
-        f"Empenho encontrado no registro anterior "
-        f"{dados['linha_empenho']}: {dados['resolucao']}"
+    botao = browser.find_element(
+        "xpath",
+        '//*[@id="lnkControleProcessos"]/img'
     )
-    print()
 
-    print(f"SEI ..............: {dados['sei']}")
-    print(f"Contrato .........: {dados['contrato']}")
-    print(f"Local da obra ....: {dados['local_obra']}")
-    print(f"Fonte ............: {dados['fonte']}")
-    print(f"Resolução ........: {dados['resolucao']}")
-    print(f"Empenho ..........: {dados['empenho']}")
-    print()
-
-    # Verifica se possui empenho
-    if not dados["empenho"] or not str(dados["empenho"]).strip():
-        print("⚠️ Registro sem empenho!")
-        print("=" * 60)
-        input("\nPressione ENTER para encerrar...")
-        return
-
-    extrato = robo.consultar_empenho(dados["empenho"])
-
-    # ============================================================
-    # PREENCHE DADOS ORÇAMENTÁRIOS NA PLANILHA
-    # ============================================================
-
-    linha = dados["linha"]
-
-    robo.aba.update(
-        range_name=f"AC{linha}:AG{linha}",
-        values=[[
-            extrato["acao"],               
-            extrato["subacao"],            
-            extrato["fonte"],              
-            dados["resolucao"],            
-            extrato["ficha_financeira"]    
-        ]]
+    browser.execute_script(
+        "arguments[0].click();",
+        botao
     )
 
+    browser.sleep(5)
 
-    valor_liquidar = float(
-        extrato["valor_liquidar"]
-        .replace(".", "")
-        .replace(",", ".")
-    )
+def capturar_link_processo(browser):
 
-    robo.aba.update_cell(
-        linha,
-        37,  # AK
-        valor_liquidar
-    )
+    try:
 
-    valor_pagar_liquidado = float(
-        extrato["valor_pagar_liquidado"]
-        .replace(".", "")
-        .replace(",", ".")
-    )
+        url = browser.current_url
 
-    valor_ne = dados["valor_ne"]
+        parametros = parse_qs(
+            urlparse(url).query
+        )
 
+        id_procedimento = parametros.get(
+            "id_protocolo",
+            [None]
+        )[0]
 
-    # ============================================================
-    # CONFERÊNCIA
-    # ============================================================
+        if not id_procedimento:
+            return None
 
-    #print("CONFERÊNCIA DA NE")
+        link = (
+            "https://sei.pe.gov.br/sei/controlador.php"
+            "?acao=procedimento_trabalhar"
+            f"&id_procedimento={id_procedimento}"
+        )
 
-    #print(
-    #    f"Soma resoluções ..: R$ "
-    #    f"{valor_ne:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    #)
+        return link
 
-    #print(
-    #    f"Pago/Liquidado ...: R$ "
-    #    f"{valor_pagar_liquidado:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    #)
+    except Exception as erro:
 
-    #if abs(valor_ne - valor_pagar_liquidado) < 0.01:
-    #    print("Resultado ........: ✅ OK")
-    #    valor_disponivel = valor_liquidar
-    #else:
-    #    print("Resultado ........: ❌ DIVERGENTE")
-    #    valor_disponivel = valor_liquidar - valor_ne
+        print(f"ERRO AO CAPTURAR LINK: {erro}")
 
-
-    # ============================================================
-    # DADOS ORÇAMENTÁRIOS
-    # ============================================================
-
-    #print()
-    print("DADOS ORÇAMENTÁRIOS")
-
-    print(f"Ficha Financeira .: {extrato['ficha_financeira']}")
-    print(f"Ação .............: {extrato['acao']}")
-    print(f"Subação ..........: {extrato['subacao']}")
-    print(f"Fonte ............: {extrato['fonte']}")
-    print(f"Valor a Liquidar .: R$ {extrato['valor_liquidar']}")
-
-    print("=" * 60)
-
+        return None
 
 if __name__ == "__main__":
-    main()
+
+    print("Iniciando...")
+    data_hoje = datetime.now().strftime("%d/%m/%Y")
+    print(f"RELATÓRIO ROBÔ DESPACHO ({data_hoje})")
+
+
+    print("========================================================================================")
+    
+    while True:
+
+        try:
+
+            browser = iniciar_robo()
+
+            lista = obter_aguardando_sei()
+
+            # TESTE APENAS PARA O SEI: 00609110022140.000002/2026-51
+           # lista = [
+           #     item for item in lista
+           #     if item["linha_planilha"] == 596
+           # ]
+
+            print()
+            print("SEIS EM MONITORAMENTO:")
+            print()
+
+            for item in lista:
+
+                print(
+                    f"[{item['linha_planilha']}] "
+                    f"{item['numero_sei']}"
+                )
+
+            print()
+            print(
+                f"TOTAL: {len(lista)} PROCESSOS"
+            )
+
+            print(
+                "=" * 88
+            )
+
+            if not lista:
+
+                print(
+                    "NENHUM AGUARDANDO SEI"
+                )
+
+                browser.quit()
+
+                time.sleep(30)
+
+                continue
+
+            for dados in lista:
+
+                print(
+                    f"VERIFICANDO "
+                    f"{dados['numero_sei']}"
+                )
+
+                encontrado = verificar_recebidos(
+                    browser,
+                    dados["numero_sei"]
+                )
+
+                if not encontrado:
+
+                    continue
+
+                gop_existe = verificar_gop_existente(
+                    browser
+                )
+
+                if gop_existe:
+
+                    print(
+                        f"{dados['numero_sei']} "
+                        f"JÁ POSSUI DOCUMENTO DE DISPONIBILIDADE"
+                    )
+
+                    print(
+                        "=" * 88
+                    )
+
+                    voltar_recebidos(browser)
+
+                    continue
+
+
+                documento = criar_documento(browser,dados)
+
+                if not documento:
+
+                    worksheet = conectar_planilha()
+
+                    worksheet.update_cell(
+                        dados["linha_planilha"],
+                        39,  # AM
+                        "SOLICITAÇÃO NÃO ENCONTRADA"
+                    )
+
+                    voltar_recebidos(browser)
+
+                    continue
+
+                #
+                # CAPTURA O ID DO DOCUMENTO
+                #
+
+                id_documento = capturar_id_documento(browser)
+
+                if not id_documento:
+
+                    print("ID DO DOCUMENTO NÃO ENCONTRADO")
+
+                    voltar_recebidos(browser)
+
+                    continue
+
+                #
+                # EDITA O DOCUMENTO
+                #
+
+                sucesso = editar_mensagem(
+                    browser,
+                    dados,
+                    documento,
+                    id_documento
+                )
+
+                if sucesso:
+
+                    atualizar_planilha_enviado(
+                        dados["linha_planilha"]
+                    )
+
+                else:
+
+                    print(
+                        f"ERRO AO EDITAR {dados['numero_sei']}"
+                    )
+
+                voltar_recebidos(browser)
+
+                print("=" * 88)
+
+                time.sleep(30)
+
+        except Exception as erro:
+
+            print(
+                f"ERRO GERAL: {erro}"
+            )
+
+            try:
+                browser.quit()
+            except:
+                pass
+
+            time.sleep(30)
