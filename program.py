@@ -534,10 +534,34 @@ def main():
 
     extrato = robo.consultar_empenho(dados["empenho"])
 
+    # ============================================================
+    # PREENCHE DADOS ORÇAMENTÁRIOS NA PLANILHA
+    # ============================================================
+
+    linha = dados["linha"]
+
+    robo.aba.update(
+        range_name=f"AC{linha}:AG{linha}",
+        values=[[
+            extrato["acao"],               
+            extrato["subacao"],            
+            extrato["fonte"],              
+            dados["resolucao"],            
+            extrato["ficha_financeira"]    
+        ]]
+    )
+
+
     valor_liquidar = float(
         extrato["valor_liquidar"]
         .replace(".", "")
         .replace(",", ".")
+    )
+
+    robo.aba.update_cell(
+        linha,
+        37,  # AK
+        valor_liquidar
     )
 
     valor_pagar_liquidado = float(
